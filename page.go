@@ -1,13 +1,16 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"text/template"
+
+	"github.com/joho/godotenv"
+	_ "github.com/tursodatabase/libsql-client-go/libsql"
 )
 
 type Page struct {
@@ -15,44 +18,57 @@ type Page struct {
 	Body  []byte
 }
 
-const data_folder string = "data"
+type Server struct {
+	db *sql.DB
+}
 
-func (p *Page) save(title string) error {
-	if title != p.Title && title != "new" {
-		tmpRemove := title + ".txt"
-		err := os.Remove(filepath.Join(data_folder, tmpRemove))
-		if err != nil {
-			return err
+func (s *Server) loadPage(title string) (*Page, error) {
+	row := s.db.QueryRow(`SELECT title, body FROM pages WHERE title = ?`, title)
+	var p Page
+	if err := row.Scan(&p.Title, &p.Body); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("tato stranka neexistuje")
 		}
+		return nil, fmt.Errorf("nenasiel som stranku: %w", err)
 	}
-	filename := p.Title + ".txt"
-	filePath := filepath.Join(data_folder, filename)
-	return os.WriteFile(filePath, p.Body, 0600)
+	return &p, nil
 }
 
-func loadPage(title string) (*Page, error) {
-	filename := title + ".txt"
-	filePath := filepath.Join(data_folder, filename)
-	body, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{Title: title, Body: body}, nil
+func (s *Server) createOrUpdatePage(p *Page) error {
+	_, err := s.db.Exec(`
+		INSERT INTO pages (title, body)
+		VALUES (?, ?)
+		ON CONFLICT(title)
+		DO UPDATE SET body = excluded.body
+	`, p.Title, p.Body)
+	return err
 }
 
-func renderTemplate(w http.ResponseWriter, temp string, p *Page) {
-	filename := temp + ".html"
+func (s *Server) deletePage(title string) error {
+	log.Println("Deleting page", title)
+	_, err := s.db.Exec(`DELETE FROM pages WHERE title = ?`, title)
+	return err
+}
+
+func renderTemplate(w http.ResponseWriter, tmpl string, p *Page) {
+	filename := tmpl + ".html"
 	t, err := template.ParseFiles(filepath.Join("templates", filename))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("template neexistuje: %v", err), http.StatusInternalServerError)
 		return
 	}
-	t.Execute(w, p)
+	if err := t.Execute(w, p); err != nil {
+		http.Error(w, fmt.Sprintf("syntaxicka chyba v: %v", err), http.StatusInternalServerError)
+	}
 }
 
-func viewHandler(w http.ResponseWriter, r *http.Request) {
-	title := r.URL.Path[len("/view/"):]
-	p, err := loadPage(title)
+func parseTitle(r *http.Request, prefix string) string {
+	return r.URL.Path[len(prefix):]
+}
+
+func (s *Server) viewHandler(w http.ResponseWriter, r *http.Request) {
+	title := parseTitle(r, "/view/")
+	p, err := s.loadPage(title)
 	if err != nil {
 		http.Redirect(w, r, "/edit/"+title, http.StatusFound)
 		return
@@ -60,64 +76,88 @@ func viewHandler(w http.ResponseWriter, r *http.Request) {
 	renderTemplate(w, "view", p)
 }
 
-func editHandler(w http.ResponseWriter, r *http.Request) {
-	title := r.URL.Path[len("/edit/"):]
-	p, err := loadPage(title)
+func (s *Server) editHandler(w http.ResponseWriter, r *http.Request) {
+	title := parseTitle(r, "/edit/")
+	p, err := s.loadPage(title)
 	if err != nil {
 		p = &Page{Title: title}
 	}
 	renderTemplate(w, "edit", p)
 }
 
-func saveHandler(w http.ResponseWriter, r *http.Request) {
-	title := r.URL.Path[len("/save/"):]
-	name := r.FormValue("name")
+func (s *Server) saveHandler(w http.ResponseWriter, r *http.Request) {
+	oldTitle := parseTitle(r, "/save/")
+	newTitle := r.FormValue("name")
 	body := r.FormValue("body")
-	p := &Page{Title: name, Body: []byte(body)}
-	err := p.save(title)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if oldTitle == "new" {
+		oldTitle = newTitle
+	}
+
+	p := &Page{Title: newTitle, Body: []byte(body)}
+	if err := s.createOrUpdatePage(p); err != nil {
+		http.Error(w, fmt.Sprintf("neulozil som stranku: %v", err), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/view/"+name, http.StatusFound)
+	http.Redirect(w, r, "/view/"+newTitle, http.StatusFound)
 }
 
-func listHandler(w http.ResponseWriter, r *http.Request) {
-	pages, err := os.ReadDir("data")
+func (s *Server) listHandler(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Query(`SELECT title FROM pages`)
 	if err != nil {
-		http.Error(w, "chyba pri citani directory data", http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("nenasiel som stranky: %v", err), http.StatusInternalServerError)
 		return
 	}
+	defer rows.Close()
+
+	var titles []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			http.Error(w, fmt.Sprintf("nazov neexistuje: %v", err), http.StatusInternalServerError)
+			return
+		}
+		titles = append(titles, t)
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, "<form action=\"edit/new\">"+"<input type=\"submit\" value=\"Create note\"\\>"+"</form>")
-	fmt.Fprintf(w, "<ul>")
-	for _, page := range pages {
-		name := page.Name()
-		name = strings.ReplaceAll(name, ".txt", "")
-		fmt.Fprintf(w, "<li><a href=\"/view/%s\">%s</a></li>", name, name)
+	fmt.Fprint(w, `<form action="/edit/new" method="get">
+		           <input type="submit" value="Create note"/>
+		           </form>`)
+	fmt.Fprint(w, `<ul>`)
+	for _, title := range titles {
+		fmt.Fprintf(w, `<li>%s - <a href="/view/%s">View</a> | <a href="/delete/%s">Delete</a></li>`,
+			title, title, title)
 	}
-	fmt.Fprintf(w, "</ul>")
+	fmt.Fprint(w, `</ul>`)
 }
 
-func deleteHandler(w http.ResponseWriter, r *http.Request) {
-	title := r.URL.Path[len("/delete/"):]
-	filename := title + ".txt"
-	err := os.Remove(filepath.Join("data", filename))
-	if err != nil {
-		http.Error(w, "chyba pri mazani suboru", http.StatusInternalServerError)
+func (s *Server) deleteHandler(w http.ResponseWriter, r *http.Request) {
+	title := parseTitle(r, "/delete/")
+	log.Println("Deleting page", title)
+	if err := s.deletePage(title); err != nil {
+		http.Error(w, fmt.Sprintf("neviem vymazat entry: %v", err), http.StatusInternalServerError)
+		return
 	}
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func main() {
-	err := os.MkdirAll(data_folder, os.ModePerm)
-	if err != nil {
-		log.Fatal("nedokazal som vytvorit dir", err)
+	if err := godotenv.Load(); err != nil {
+		return
 	}
-	http.HandleFunc("/view/", viewHandler)
-	http.HandleFunc("/edit/", editHandler)
-	http.HandleFunc("/save/", saveHandler)
-	http.HandleFunc("/detele/", deleteHandler)
-	http.HandleFunc("/", listHandler)
+	dbURL := os.Getenv("TURSO_DATABASE_URL")
+	authToken := os.Getenv("TURSO_AUTH_TOKEN")
+	connString := fmt.Sprintf("%s?authToken=%s", dbURL, authToken)
+	db, err := sql.Open("libsql", connString)
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	s := &Server{db: db}
+	http.HandleFunc("/view/", s.viewHandler)
+	http.HandleFunc("/edit/", s.editHandler)
+	http.HandleFunc("/save/", s.saveHandler)
+	http.HandleFunc("/delete/", s.deleteHandler)
+	http.HandleFunc("/", s.listHandler)
 	log.Fatal(http.ListenAndServe(":42069", nil))
 }
