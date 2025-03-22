@@ -1,0 +1,8 @@
+<h1>{{.Title}}</h1>
+<form action="/">
+    <input type="submit" value="Return to home" />
+</form>
+
+<p>[<a href="/edit/{{.Title}}">edit</a>]</p>
+
+<div>{{printf "%s" .Body}}</div>
